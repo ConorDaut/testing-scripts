@@ -2,7 +2,7 @@
 # =============================================================================
 # php-check.sh
 # =============================================================================
-# Code Made using Claude Sonnet 5.5 Medium
+# Made using Claude Sonnet 5.5 Medium
 # STILL REQUIRES TESTING
 # PURPOSE
 #   Checks a Linux host for PHP, determines whether the installed PHP is
@@ -30,6 +30,9 @@
 #   Rocky Linux, Fedora             (dnf; RHEL/Alma/CentOS also work)
 #   Alpine Linux                    (apk; bash is installed automatically)
 #   VyOS                            (DETECT AND REPORT ONLY - no changes made)
+#   Arch Linux and derivatives      (pacman; needs a FULL system upgrade)
+#   OPNsense (FreeBSD)              (pkg; bash is installed automatically)
+#   Tiny Core Linux                 (tce-update; fix loads after a reboot)
 #
 # USAGE
 #   sudo ./php-check.sh [options]
@@ -37,6 +40,8 @@
 #                        third-party repositories)
 #         --third-party  Allow adding a third-party repo (Sury / Remi) if the
 #                        distro repositories do not have the fix yet
+#         --full-upgrade Approve the full system/package upgrade that Arch
+#                        (pacman -Syu) and OPNsense (pkg upgrade) require
 #         --dry-run      Show what would be done; change nothing
 #     -h, --help         Show this help
 #
@@ -48,12 +53,23 @@
 #     branch is still unprotected afterwards, it stops and reports the problem.
 #   * Debian/Ubuntu packages may restart some services on their own during the
 #     upgrade (package post-install scripts). Step 4 restarts the rest.
+#   * Arch Linux does not support partial upgrades, so fixing PHP means a full
+#     'pacman -Syu'. The script asks first (or use --full-upgrade).
+#   * OPNsense: the officially recommended way to update is System > Firmware >
+#     Updates in the web GUI. The CLI route used here is a full 'pkg upgrade'
+#     (asks first, or use --full-upgrade). Fixed releases: Community 26.7.7
+#     (PHP 8.5.12) and Business 26.4.2p3 (PHP 8.3.36). Afterwards the web GUI
+#     and, if configured, the captive portal are restarted.
+#   * Tiny Core Linux: tce-load/tce-update refuse to run as root, so they are run
+#     as user "tc". Updated extensions are only STAGED and load at next boot, so
+#     the script offers a reboot; run it again afterwards to verify. Needs a
+#     persistent TCE directory.
 #   * A log of everything run is written to /var/log/php-check.log
 #
 # EXIT CODES
 #   0 protected / nothing to do      1 non-fatal command error(s) occurred
 #   2 not root or unsupported OS     3 EOL PHP branch still unprotected
-#   4 PHP still vulnerable
+#   4 PHP still vulnerable          6 update staged, reboot required (Tiny Core)
 # =============================================================================
 
 # --- Bootstrap: this script needs bash (Alpine ships only ash by default) ----
@@ -63,6 +79,18 @@ if [ -z "${BASH_VERSION:-}" ]; then
             echo "bash not found - installing it (Alpine)..."
             apk add --no-cache bash >/dev/null 2>&1 || {
                 echo "ERROR: could not install bash (are you root?)"; exit 1; }
+        elif [ -d /usr/local/opnsense ] && command -v pkg >/dev/null 2>&1; then
+            echo "bash not found - installing it (OPNsense)..."
+            pkg install -y bash >/dev/null 2>&1 || {
+                echo "ERROR: could not install bash (are you root?)"; exit 1; }
+        elif command -v tce-load >/dev/null 2>&1; then
+            # Tiny Core: tce-load must run as the unprivileged user "tc"
+            echo "bash not found - installing it (Tiny Core)..."
+            if command -v sudo >/dev/null 2>&1; then
+                sudo -u tc tce-load -wi bash.tcz >/dev/null 2>&1
+            else
+                su tc -c "tce-load -wi bash.tcz" >/dev/null 2>&1
+            fi || { echo "ERROR: could not install bash."; exit 1; }
         else
             echo "ERROR: bash is required to run this script."; exit 1
         fi
@@ -83,12 +111,14 @@ declare -A FIXED_VERSION=( [8.2]="8.2.35" [8.3]="8.3.36" [8.4]="8.4.27" [8.5]="8
 # Per-branch state, filled in by detect_php / evaluate_branch:
 declare -A BRANCH_VER BRANCH_STATUS BRANCH_REASON   # status: PROTECTED|VULNERABLE|EOL
 
-ASSUME_YES=0; ALLOW_THIRD_PARTY=0; DRY_RUN=0
+ASSUME_YES=0; ALLOW_THIRD_PARTY=0; DRY_RUN=0; FULL_UPGRADE=0
+REBOOT_NEEDED=0                # 1 on Tiny Core after staging an update
+OPNSENSE=0                     # 1 when running on OPNsense
 ERRORS=0                       # count of non-fatal command failures
-PM=""; PM_BIN=""               # package manager (apt|dnf|apk|none) and binary
+PM=""; PM_BIN=""               # package manager (apt|dnf|apk|pacman|pkg|tce|none) and binary
 REPORT_ONLY=0                  # 1 on VyOS: never change anything
 OS_ID=""; OS_VERSION_ID=""; OS_CODENAME=""; OS_PRETTY=""
-INIT=""                        # systemd | openrc | sysv
+INIT=""                        # systemd | openrc | sysv | opnsense | tce
 ALL_PKGS=()                    # installed PHP-related packages
 
 # =============================================================================
@@ -182,19 +212,31 @@ preflight() {
     fi
     local like; like=$(. /etc/os-release 2>/dev/null; echo "${ID_LIKE:-}")
 
-    # VyOS is Debian-based but is an appliance: detect it first, report only.
+    # Appliance/special systems are detected first: several of them look like
+    # another OS (VyOS = Debian) or have no /etc/os-release (OPNsense).
     if [ -f /etc/vyos-release ] || [ -d /opt/vyatta ] || [ "$OS_ID" = "vyos" ] \
        || grep -qi vyos /etc/os-release 2>/dev/null; then
+        # VyOS is Debian-based but is an appliance: report only.
         OS_ID="vyos"; OS_PRETTY="VyOS"; PM="none"; REPORT_ONLY=1
+    elif [ -d /usr/local/opnsense ] || command -v opnsense-version >/dev/null 2>&1; then
+        # OPNsense (FreeBSD): packages are managed with pkg.
+        OS_ID="opnsense"; PM="pkg"; OPNSENSE=1
+        OS_PRETTY=$(opnsense-version 2>/dev/null | head -n1)
+        [ -n "$OS_PRETTY" ] || OS_PRETTY="OPNsense"
+    elif command -v tce-load >/dev/null 2>&1 || [ -d /etc/sysconfig/tcedir ]; then
+        # Tiny Core Linux: PHP comes as .tcz extensions.
+        OS_ID="tinycore"; OS_PRETTY="Tiny Core Linux"; PM="tce"
     else
         case "$OS_ID" in
             debian|ubuntu|kali)             PM="apt" ;;
             rocky|fedora|rhel|almalinux|centos) PM="dnf" ;;
             alpine)                         PM="apk" ;;
+            arch|manjaro|endeavouros|garuda|cachyos|artix) PM="pacman" ;;
             *)  # Fall back to ID_LIKE for derivatives (Mint, Raspbian, Oracle...)
                 case " $like " in
                     *" debian "*|*" ubuntu "*)        PM="apt" ;;
                     *" rhel "*|*" fedora "*|*" centos "*) PM="dnf" ;;
+                    *" arch "*)                       PM="pacman" ;;
                     *) PM="" ;;
                 esac ;;
         esac
@@ -206,12 +248,14 @@ preflight() {
     fi
 
     if [ -z "$PM" ]; then
-        fail "Unsupported OS: '$OS_ID'. Supported: Debian, Ubuntu, Kali, Rocky, Fedora, Alpine, VyOS. Exit code 2."
+        fail "Unsupported OS: '$OS_ID'. Supported: Debian, Ubuntu, Kali, Rocky, Fedora, Alpine, Arch, OPNsense, Tiny Core, VyOS. Exit code 2."
         exit 2
     fi
 
     # Which init system manages services (used in Step 4).
-    if [ -d /run/systemd/system ]; then INIT=systemd
+    if [ "$OPNSENSE" -eq 1 ]; then INIT=opnsense
+    elif [ "$PM" = "tce" ]; then INIT=tce
+    elif [ -d /run/systemd/system ]; then INIT=systemd
     elif command -v rc-service >/dev/null 2>&1; then INIT=openrc
     else INIT=sysv; fi
 
@@ -238,6 +282,15 @@ list_php_pkgs() {
                 | grep -E '^(mod_)?php[0-9.]*(-[a-z0-9._+-]+)?$' | sort -u) ;;
         apk)
             mapfile -t ALL_PKGS < <(apk info 2>/dev/null | grep -E '^php[0-9]*(-.*)?$' | sort -u) ;;
+        pacman)   # Arch: php, php-fpm, php-apache, php-cgi ... (legacy: php82, php82-fpm)
+            mapfile -t ALL_PKGS < <(pacman -Qq 2>/dev/null \
+                | grep -E '^php[0-9]*(-[a-z0-9._+-]+)?$' | sort -u) ;;
+        pkg)      # OPNsense/FreeBSD: php85, php85-session ...
+            mapfile -t ALL_PKGS < <(pkg query '%n' 2>/dev/null \
+                | grep -E '^php[0-9]*(-[a-z0-9._+-]+)?$' | sort -u) ;;
+        tce)      # Tiny Core keeps one marker file per loaded extension here
+            mapfile -t ALL_PKGS < <(ls /usr/local/tce.installed 2>/dev/null \
+                | grep -E '^php' | sort -u) ;;
     esac
 }
 
@@ -247,7 +300,7 @@ pkgs_for_branch() {
     local branch=$1 nodot=${1//./} p
     local -a out=()
     for p in "${ALL_PKGS[@]}"; do
-        case "$p" in *php"$branch"*|*php"$nodot"*) out+=("$p") ;; esac
+        case "$p" in *php"$branch"*|*php"$nodot"*|*php-"$branch"*) out+=("$p") ;; esac
     done
     # Distros that use unversioned names (RHEL/Rocky/Fedora native PHP)
     if [ ${#out[@]} -eq 0 ]; then
@@ -279,7 +332,7 @@ detect_php() {
         p=$(command -v "$b" 2>/dev/null) && cands+=("$p")
     done
     for p in /usr/bin/php[0-9]* /usr/bin/php-cgi[0-9]* /usr/sbin/php-fpm* \
-             /usr/sbin/php[0-9]*-fpm /usr/local/bin/php /usr/local/sbin/php-fpm \
+             /usr/sbin/php[0-9]*-fpm /usr/local/bin/php /usr/local/bin/php-cgi /usr/local/sbin/php-fpm \
              /opt/remi/php*/root/usr/bin/php /opt/remi/php*/root/usr/sbin/php-fpm; do
         [ -f "$p" ] && [ -x "$p" ] && cands+=("$p")
     done
@@ -303,6 +356,9 @@ detect_php() {
                 apt) ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null) ;;
                 dnf) ver=$(rpm -q --qf '%{VERSION}' "$pkg" 2>/dev/null) ;;
                 apk) ver=$(apk info -v "$pkg" 2>/dev/null | head -n1 | sed "s/^$pkg-//") ;;
+                pacman) ver=$(pacman -Q "$pkg" 2>/dev/null | awk '{print $2}') ;;
+                pkg) ver=$(pkg query '%v' "$pkg" 2>/dev/null) ;;
+                *)   ver="" ;;   # Tiny Core names carry no patch level
             esac
             [[ $ver =~ $re ]] && add_version "${BASH_REMATCH[1]}"
         done
@@ -395,7 +451,31 @@ pm_refresh() {
         apt) run_cmd "Refreshing package index" apt-get update ;;
         dnf) run_cmd "Refreshing package metadata" "$PM_BIN" -y makecache ;;
         apk) run_cmd "Refreshing package index" apk update ;;
+        pacman) info "Arch: no standalone database sync (partial upgrades are unsupported); 'pacman -Syu' syncs and upgrades together." ;;
+        pkg) run_cmd "Refreshing package catalogue" pkg update -f ;;
+        tce) : ;;   # tce-update contacts the mirror itself
     esac
+}
+
+# Tiny Core: tce-load / tce-update refuse to run as root, so run them as user "tc".
+tce_as_tc() {
+    if command -v sudo >/dev/null 2>&1; then sudo -u tc "$@" </dev/null
+    else su tc -c "$*" </dev/null; fi
+}
+
+# tce_update_exts ext... -> stage an update for each installed extension.
+# The new .tcz is downloaded now but only loaded at the next boot.
+tce_update_exts() {
+    local dir=/etc/sysconfig/tcedir/optional ext rc=0
+    if [ ! -d "$dir" ]; then
+        fail "No persistent TCE directory ($dir): updates would be lost at reboot."
+        ERRORS=$((ERRORS + 1)); return 1
+    fi
+    for ext in "$@"; do
+        if [ ! -f "$dir/$ext.tcz" ]; then warn "$ext.tcz not found in $dir - skipped."; continue; fi
+        run_cmd "Staging update for $ext.tcz" tce_as_tc tce-update update "$dir/$ext.tcz" || rc=1
+    done
+    return $rc
 }
 
 # pm_upgrade pkg... -> upgrade ONLY the named packages, never installing new ones
@@ -407,6 +487,22 @@ pm_upgrade() {
                  -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" ;;
         dnf) run_cmd "Upgrading: $*" "$PM_BIN" -y upgrade "$@" ;;
         apk) run_cmd "Upgrading: $*" apk add --upgrade "$@" ;;
+        pacman)
+            warn "Arch does not support partial upgrades: this needs a FULL system upgrade (pacman -Syu)."
+            if [ "$DRY_RUN" -eq 1 ] || [ "$FULL_UPGRADE" -eq 1 ] || ask_yn "Run 'pacman -Syu' now?"; then
+                run_cmd "Full system upgrade (pacman -Syu)" pacman -Syu --noconfirm
+            else
+                info "Skipped (use --full-upgrade to approve automatically)."; return 1
+            fi ;;
+        pkg)
+            warn "OPNsense normally updates PHP via System > Firmware > Updates (recommended)."
+            warn "The CLI route used here is a FULL package upgrade (pkg upgrade), not only PHP."
+            if [ "$DRY_RUN" -eq 1 ] || [ "$FULL_UPGRADE" -eq 1 ] || ask_yn "Run 'pkg upgrade' now?"; then
+                run_cmd "Full package upgrade (pkg upgrade)" pkg upgrade -y
+            else
+                info "Skipped (use --full-upgrade to approve automatically)."; return 1
+            fi ;;
+        tce) tce_update_exts "$@" ;;
     esac
 }
 
@@ -476,9 +572,10 @@ SERVICE_PATTERNS=(
     '^php-fpm[0-9]*$'         # Rocky/Fedora: php-fpm   Alpine: php-fpm83
     '^php[0-9]+-php-fpm$'     # Remi: php83-php-fpm
     '^lsphp'                  # LiteSpeed PHP
-    '^apache2$' '^httpd$'     # Apache (Debian-style / RHEL-style)
+    '^apache2[.0-9]*$' '^httpd$'   # Apache (Debian-style / RHEL-/Arch-style / Tiny Core)
     '^nginx$' '^lighttpd$'
     '^caddy$' '^frankenphp$'
+    '^webgui$' '^captiveportal$'   # OPNsense GUI (runs on PHP) and captive portal
     '^lshttpd$' '^lsws$' '^litespeed$'   # LiteSpeed
 )
 
@@ -498,6 +595,17 @@ list_active_services() {
                 s=$(basename "$f")
                 service "$s" status >/dev/null 2>&1 && echo "$s"
             done ;;
+        opnsense)
+            # The web GUI always runs on PHP; the captive portal only if configured.
+            echo webgui
+            grep -q '<captiveportal' /conf/config.xml 2>/dev/null && echo captiveportal ;;
+        tce)
+            # Tiny Core extensions ship init scripts in /usr/local/etc/init.d
+            for f in /usr/local/etc/init.d/*; do
+                [ -x "$f" ] || continue
+                s=$(basename "$f")
+                "$f" status >/dev/null 2>&1 && echo "$s"
+            done ;;
     esac
 }
 
@@ -508,6 +616,17 @@ service_cmd() {   # service_cmd <restart|is-active> name
                  else rc-service "$2" "$1"; fi ;;
         sysv)    if [ "$1" = "is-active" ]; then service "$2" status >/dev/null 2>&1
                  else service "$2" "$1"; fi ;;
+        opnsense)
+            case "$1:$2" in
+                restart:webgui)
+                    if [ -x /usr/local/etc/rc.restart_webgui ]; then /usr/local/etc/rc.restart_webgui >/dev/null 2>&1
+                    else configctl webgui restart >/dev/null 2>&1; fi ;;
+                restart:captiveportal) configctl captiveportal restart >/dev/null 2>&1 ;;
+                is-active:webgui) pgrep -f 'lighttpd|nginx|php-cgi|php-fpm' >/dev/null 2>&1 ;;
+                *) return 0 ;;
+            esac ;;
+        tce)     if [ "$1" = "is-active" ]; then "/usr/local/etc/init.d/$2" status >/dev/null 2>&1
+                 else "/usr/local/etc/init.d/$2" restart; fi ;;
     esac
 }
 
@@ -574,6 +693,14 @@ step3_update() {
     pm_refresh
     pm_upgrade "${pkgs[@]}"
     [ "$DRY_RUN" -eq 1 ] && return
+
+    # Tiny Core only stages updates; they load at the next boot, so we cannot
+    # re-check the running version yet.
+    if [ "$PM" = "tce" ]; then
+        REBOOT_NEEDED=1
+        warn "Tiny Core updates are staged and load at next boot. Reboot, then re-run this script to verify."
+        return
+    fi
     refresh_state
 
     # If a supported branch is still vulnerable, the distro has no fix yet.
@@ -584,8 +711,9 @@ step3_update() {
     if [ ${#still[@]} -gt 0 ]; then
         local tp; tp=$(third_party_name)
         warn "The distro repositories do not (yet) provide the fix for PHP ${still[*]}."
+        [ "$OPNSENSE" -eq 1 ] && info "OPNsense fixes: Community 26.7.7 (PHP 8.5.12), Business 26.4.2p3 (PHP 8.3.36) - upgrade to those releases or newer."
         if [ -z "$tp" ]; then
-            fail "No third-party repository option for $OS_ID. Wait for a distro update or build from source."
+            fail "No third-party repository option for $OS_ID. Wait for an official update (or move to a newer release), or build from source."
         elif [ "$ALLOW_THIRD_PARTY" -eq 1 ] || ask_yn "Add third-party repository: $tp?"; then
             if add_thirdparty_repo "${still[@]}"; then
                 pkgs=()
@@ -616,6 +744,8 @@ step4_verify_and_restart() {
     local final=0 b
     if [ "$DRY_RUN" -eq 1 ]; then
         warn "Dry-run: verification skipped (nothing was changed)."
+    elif [ "$REBOOT_NEEDED" -eq 1 ]; then
+        warn "Verification deferred: the updated PHP only loads after a reboot."
     else
         refresh_state
         print_state
@@ -627,8 +757,18 @@ step4_verify_and_restart() {
         esac
     done
 
+    # Tiny Core: the staged update is not running yet, so "vulnerable" is expected.
+    if [ "$REBOOT_NEEDED" -eq 1 ] && [ $final -ne 0 ]; then final=6; fi
+
     if [ "$REPORT_ONLY" -eq 1 ]; then
         info "VyOS: services are not restarted in report-only mode."
+        return $final
+    fi
+
+    # A reboot (not a service restart) is what activates a staged update.
+    if [ "$REBOOT_NEEDED" -eq 1 ]; then
+        warn "A reboot is required for the staged PHP update to take effect."
+        if ask_yn "Reboot now? (never auto-approved by --yes)"; then run_cmd "Rebooting" reboot; fi
         return $final
     fi
 
@@ -684,6 +824,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -y|--yes)       ASSUME_YES=1 ;;
         --third-party)  ALLOW_THIRD_PARTY=1 ;;
+        --full-upgrade) FULL_UPGRADE=1 ;;
         --dry-run)      DRY_RUN=1 ;;
         -h|--help)      usage; exit 0 ;;
         *) echo "Unknown option: $1 (see --help)"; exit 2 ;;
@@ -705,5 +846,6 @@ case $final in
        else warn "PHP is protected, but $ERRORS command(s) reported errors (see $LOG_FILE)."; exit 1; fi ;;
     3) fail "Result: an end-of-life PHP branch is still unprotected. Exit code 3."; exit 3 ;;
     4) fail "Result: PHP is still VULNERABLE to php2shell. Exit code 4."; exit 4 ;;
+    6) warn "Update staged: reboot, then re-run this script to verify. Exit code 6."; exit 6 ;;
 esac
 exit 0
